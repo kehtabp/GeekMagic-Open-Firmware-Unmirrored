@@ -29,10 +29,14 @@
 #include "config/ConfigManager.h"
 #include "wireless/WiFiManager.h"
 #include "ntp/NTPClient.h"
+#include "weather/WeatherClient.h"
+#include "crypto/CryptoClient.h"
 
 extern ConfigManager configManager;
 extern WiFiManager* wifiManager;
 extern NTPClient* ntpClient;
+extern WeatherClient weatherClient;
+extern CryptoClient cryptoClient;
 
 static bool otaError = false;
 static size_t otaSize = 0;
@@ -50,6 +54,12 @@ static void otaHandleWrite(HTTPUpload& upload);
 static void otaHandleEnd(HTTPUpload& upload, int mode);
 static void otaHandleAborted(HTTPUpload& upload);
 void handleDeleteGif(Webserver* webserver);
+void handleWeatherConfigGet(Webserver* webserver);
+void handleWeatherConfigSet(Webserver* webserver);
+void handleBrightnessGet(Webserver* webserver);
+void handleBrightnessSet(Webserver* webserver);
+void handleCryptoConfigGet(Webserver* webserver);
+void handleCryptoConfigSet(Webserver* webserver);
 
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr size_t NTP_CONFIG_DOC_SIZE = 512;
@@ -154,6 +164,15 @@ void registerApiEndpoints(Webserver* webserver) {
     // @openapi {post} /logs/clear version=v1 group=System summary="Clear log buffer" requiresAuth=true
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/logs/clear", HTTP_POST, [webserver]() { handleLogsClear(webserver); });
+
+    webserver->raw().on("/api/v1/weather/config", HTTP_POST, [webserver]() { handleWeatherConfigSet(webserver); });
+    webserver->raw().on("/api/v1/weather/config", HTTP_GET,  [webserver]() { handleWeatherConfigGet(webserver); });
+
+    webserver->raw().on("/api/v1/display/brightness", HTTP_GET,  [webserver]() { handleBrightnessGet(webserver); });
+    webserver->raw().on("/api/v1/display/brightness", HTTP_POST, [webserver]() { handleBrightnessSet(webserver); });
+
+    webserver->raw().on("/api/v1/crypto/config", HTTP_GET,  [webserver]() { handleCryptoConfigGet(webserver); });
+    webserver->raw().on("/api/v1/crypto/config", HTTP_POST, [webserver]() { handleCryptoConfigSet(webserver); });
 
     webserver->raw().onNotFound([webserver]() {
         if (webserver->raw().method() == HTTP_OPTIONS) {
@@ -1414,6 +1433,234 @@ void handleLogsClear(Webserver* webserver) {
     String json;
     serializeJson(doc, json);
 
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Get current weather location
+ */
+void handleWeatherConfigGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["weather_location"] = configManager.getWeatherLocation();
+    doc["weather_api_key"]  = configManager.getWeatherApiKey();
+
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Set weather location — persists to config and starts fetching immediately
+ * @param webserver Pointer to the Webserver instance
+ * Body: {"weather_location": "London"}
+ */
+void handleWeatherConfigSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Missing JSON body";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    JsonDocument ddoc;
+    if (deserializeJson(ddoc, webserver->raw().arg("plain"))) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Invalid JSON";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    const char* location = ddoc["weather_location"] | "";
+    const char* apiKey   = ddoc["weather_api_key"]  | "";
+    if (strlen(location) > 0) configManager.setWeatherLocation(location);
+    if (strlen(apiKey)   > 0) configManager.setWeatherApiKey(apiKey);
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Failed to save config";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+        return;
+    }
+
+    weatherClient.begin(String(configManager.getWeatherLocation()),
+                        String(configManager.getWeatherApiKey()));
+    DisplayManager::setWeatherData(0, "", false, false, configManager.getWeatherLocation());
+
+    JsonDocument doc;
+    doc["status"]           = "ok";
+    doc["weather_location"] = configManager.getWeatherLocation();
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Get current LCD brightness (0-100)
+ */
+void handleBrightnessGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) return;
+
+    JsonDocument doc;
+    doc["brightness"] = configManager.getLcdBrightness();
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Set LCD brightness (0-100), persists to config
+ * Body: {"brightness": 80}
+ */
+void handleBrightnessSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) return;
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Missing JSON body";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    JsonDocument ddoc;
+    if (deserializeJson(ddoc, webserver->raw().arg("plain"))) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Invalid JSON";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    int brightness = ddoc["brightness"] | -1;
+    if (brightness < 0 || brightness > 100) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "brightness must be 0-100";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    configManager.setLcdBrightness(static_cast<uint8_t>(brightness));
+    DisplayManager::setBrightness(static_cast<uint8_t>(brightness));
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Failed to save config";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"]     = "ok";
+    doc["brightness"] = brightness;
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Return the current crypto coins configuration.
+ * Response: {"crypto_coins":"bitcoin:BTC,ethereum:ETH"}
+ */
+void handleCryptoConfigGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) return;
+
+    JsonDocument doc;
+    doc["crypto_coins"] = configManager.getCryptoCoins();
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Update the crypto coins configuration and restart the CryptoClient.
+ * Body: {"crypto_coins":"bitcoin:BTC,ethereum:ETH"}
+ */
+void handleCryptoConfigSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) return;
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Missing JSON body";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    JsonDocument ddoc;
+    if (deserializeJson(ddoc, webserver->raw().arg("plain"))) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Invalid JSON";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    const char* coins = ddoc["crypto_coins"] | "";
+    configManager.setCryptoCoins(coins);
+    cryptoClient.begin(configManager.getCryptoCoins());
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Failed to save config";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"]       = "ok";
+    doc["crypto_coins"] = configManager.getCryptoCoins();
+    String json;
+    serializeJson(doc, json);
     setCorsHeaders(webserver);
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 }

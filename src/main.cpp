@@ -31,6 +31,9 @@
 #include "web/Webserver.h"
 #include "web/Api.h"
 #include "ntp/NTPClient.h"
+#include "wol/WakeOnLan.h"
+#include "weather/WeatherClient.h"
+#include "crypto/CryptoClient.h"
 #include <array>
 
 ConfigManager configManager;
@@ -52,6 +55,28 @@ static constexpr int LOADING_DELAY_MS = 1000;
 
 Webserver* webserver = nullptr;
 NTPClient* ntpClient = nullptr;
+static WakeOnLan wakeOnLan;
+WeatherClient weatherClient;
+CryptoClient cryptoClient;
+
+/**
+ * @brief Stop the webserver to free heap for BearSSL TLS (called by CryptoClient).
+ */
+void cryptoWebserverPause() {
+    if (webserver != nullptr) {
+        webserver->raw().stop();
+        delay(30);
+    }
+}
+
+/**
+ * @brief Restart the webserver after BearSSL TLS operations (called by CryptoClient).
+ */
+void cryptoWebserverResume() {
+    if (webserver != nullptr) {
+        webserver->raw().begin();
+    }
+}
 
 /**
  * @brief Formats bytes into a human-readable string
@@ -121,6 +146,14 @@ void setup() {
     wifiManager = new WiFiManager(configManager.getSSID(), configManager.getPassword(), AP_SSID, AP_PASSWORD);
     wifiManager->begin();
 
+    wakeOnLan.begin(configManager.getWolUrl(), configManager.getWolMac());
+
+    DisplayManager::setBrightness(configManager.getLcdBrightness());
+
+    weatherClient.begin(configManager.getWeatherLocation(), configManager.getWeatherApiKey());
+    cryptoClient.begin(configManager.getCryptoCoins());
+    DisplayManager::setWeatherData(0, "", false, false, configManager.getWeatherLocation());
+
     ntpClient = new NTPClient();
     ntpClient->begin();
 
@@ -149,6 +182,7 @@ void setup() {
     webserver->serveStaticC("/wifi.html", "/web/wifi.html", "text/html");
     webserver->serveStaticC("/token.html", "/web/token.html", "text/html");
     webserver->serveStaticC("/ntp.html", "/web/ntp.html", "text/html");
+    webserver->serveStaticC("/display.html", "/web/display.html", "text/html");
     webserver->serveStaticC("/logs.html", "/web/logs.html", "text/html");
     webserver->serveStaticC("/config.json", "/config.json", "application/json");
 
@@ -173,6 +207,30 @@ void loop() {
 
     if (ntpClient != nullptr) {
         ntpClient->loop();
+    }
+
+    wakeOnLan.loop();
+
+    weatherClient.loop();
+    {
+        static uint32_t lastWeatherSerial = 0xFFFFFFFFU;
+        uint32_t curSerial = weatherClient.getSerial();
+        if (curSerial != lastWeatherSerial) {
+            const WeatherData& wd = weatherClient.getData();
+            DisplayManager::setWeatherData(wd.tempC, wd.description, wd.umbrella, wd.valid,
+                                           configManager.getWeatherLocation());
+            lastWeatherSerial = curSerial;
+        }
+    }
+
+    cryptoClient.loop();
+    {
+        static uint32_t lastCryptoSerial = 0xFFFFFFFFU;
+        uint32_t curSerial = cryptoClient.getSerial();
+        if (curSerial != lastCryptoSerial) {
+            DisplayManager::setCryptoPrices(cryptoClient.getTickers(), CRYPTO_MAX_COINS);
+            lastCryptoSerial = curSerial;
+        }
     }
 
     DisplayManager::update();

@@ -21,19 +21,55 @@
 #include <Logger.h>
 #include <array>
 #include <algorithm>
+#include <ctime>
 #include <Arduino.h>
 
 #include "project_version.h"
 #include "display/DisplayManager.h"
 #include "config/ConfigManager.h"
 #include "display/Gif.h"
+#include "crypto/CryptoClient.h"
 
-static Gif s_gif;
+static Gif  s_gif;
+static bool s_wasGifPlaying  = false;   // set when gif is/was playing; triggers clock full-redraw
+static bool s_clockFirstDraw = true;    // forces full clear on first clock frame
 
 extern ConfigManager configManager;
 
 static Arduino_HWSPI g_lcdBus = Arduino_HWSPI(LCD_DC_GPIO, -1, &SPI, true);
-static Arduino_ST7789 g_lcd = Arduino_ST7789(&g_lcdBus, -1, 0, true, LCD_W, LCD_H);
+
+// MADCTL (0x36) has no effect on this panel variant — gate scan direction is
+// hardware-locked. Mirror X in software:
+//   1. writeAddrWindow maps logical (x,y,w,h) → physical (_width-x-w, y, w, h)
+//   2. writePixels reverses every row of _currentW pixels so pixel order matches
+//      the reversed physical scan direction.
+class MirroredST7789 : public Arduino_ST7789 {
+public:
+    using Arduino_ST7789::Arduino_ST7789;
+
+    void writeAddrWindow(int16_t x, int16_t y, uint16_t w, uint16_t h) override {
+        Arduino_ST7789::writeAddrWindow((int16_t)_width - x - (int16_t)w, y, w, h);
+    }
+
+    void writePixels(uint16_t *data, uint32_t len) override {
+        uint32_t w = _currentW;
+        if (w <= 1) {
+            Arduino_ST7789::writePixels(data, len);
+            return;
+        }
+        uint16_t rowBuf[LCD_W];
+        uint32_t offset = 0;
+        while (offset < len) {
+            uint32_t rowLen = (len - offset >= w) ? w : (len - offset);
+            for (uint32_t i = 0; i < rowLen; i++) {
+                rowBuf[i] = data[offset + rowLen - 1 - i];
+            }
+            Arduino_ST7789::writePixels(rowBuf, rowLen);
+            offset += rowLen;
+        }
+    }
+};
+static MirroredST7789 g_lcd = MirroredST7789(&g_lcdBus, -1, 0, true, LCD_W, LCD_H);
 
 static constexpr uint32_t LCD_HARDWARE_RESET_DELAY_MS = 120;
 static constexpr uint32_t LCD_BEGIN_DELAY_MS = 10;
@@ -217,6 +253,19 @@ auto DisplayManager::getGfx() -> Arduino_GFX* { return &g_lcd; }
 static inline void lcdBacklightOn() {
     pinMode((uint8_t)LCD_BACKLIGHT_GPIO, OUTPUT);
     digitalWrite((uint8_t)LCD_BACKLIGHT_GPIO, LCD_BACKLIGHT_ACTIVE_LOW ? LOW : HIGH);
+}
+
+/**
+ * @brief Set backlight brightness via PWM (0 = off, 100 = full)
+ */
+void DisplayManager::setBrightness(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    // analogWrite range 0-1023; backlight is active-low so invert
+    int pwmVal = LCD_BACKLIGHT_ACTIVE_LOW
+                     ? ((100 - percent) * 1023 / 100)
+                     : (percent * 1023 / 100);
+    pinMode((uint8_t)LCD_BACKLIGHT_GPIO, OUTPUT);
+    analogWrite((uint8_t)LCD_BACKLIGHT_GPIO, pwmVal);
 }
 
 /**
@@ -655,6 +704,8 @@ auto DisplayManager::playGifFullScreen(const String& path, uint32_t timeMs) -> b
         return false;
     }
 
+    s_wasGifPlaying = true;
+
     if (timeMs == 0) {
         return true;
     }
@@ -694,11 +745,345 @@ auto DisplayManager::stopGif() -> bool {
     return true;
 }
 
-auto DisplayManager::update() -> void { s_gif.update(); }
+// ---------------------------------------------------------------------------
+// Clock + weather screen
+// ---------------------------------------------------------------------------
+
+// Layout constants (240×240 panel)
+static constexpr int16_t CW_DATE_Y        = 5;
+static constexpr uint8_t CW_DATE_SIZE     = 2;
+static constexpr int16_t CW_TIME_Y        = 28;
+static constexpr uint8_t CW_TIME_SIZE     = 4;
+static constexpr int16_t CW_TEMP_Y        = 72;
+static constexpr uint8_t CW_TEMP_SIZE     = 4;
+static constexpr int16_t CW_DESC_Y        = 116;
+static constexpr uint8_t CW_DESC_SIZE     = 2;
+static constexpr int16_t CW_UMBRELLA_Y    = 156;
+static constexpr uint8_t CW_UMBRELLA_SIZE = 2;
+static constexpr int16_t CW_LOC_Y         = 184;
+static constexpr uint8_t CW_LOC_SIZE      = 1;
+static constexpr time_t  CW_REASONABLE_EPOCH = 1600000000UL;
+
+// Weather state (written by setWeatherData, read by lcdDrawClockWeather)
+static int      s_cwTempC       = 0;
+static char     s_cwDesc[48]    = {};
+static bool     s_cwUmbrella    = false;
+static bool     s_cwValid       = false;
+static char     s_cwLocation[48]= {};
+static uint32_t s_cwSerial      = 0;
+static unsigned long s_cwUpdatedMs = 0;
+
+// Clock-screen draw state
+static time_t   s_cwLastSecond     = -1;
+static uint32_t s_cwLastSerial     = 0xFFFFFFFFU;
+
+// ---------------------------------------------------------------------------
+// Crypto ticker state (written by setCryptoPrices, read by lcdDrawCryptoBubbles)
+// ---------------------------------------------------------------------------
+static CryptoTicker s_cryptoTickers[CRYPTO_MAX_COINS];
+static uint8_t      s_cryptoCount      = 0;
+static uint32_t     s_cryptoSerial     = 0;
+static uint32_t     s_cryptoLastSerial = 0xFFFFFFFFU;
+
+// Bubble layout constants (240×240 panel)
+static constexpr int16_t  CW_CRYPTO_Y  = 198;
+static constexpr int16_t  CW_CRYPTO_H  = 40;
+static constexpr int16_t  CW_CRYPTO_W  = 76;
+static constexpr int16_t  CW_CRYPTO_R  = 5;     // corner radius
+static constexpr int16_t  CW_CRYPTO_BX[3] = {3, 81, 159};
+
+// Bubble background colors
+static constexpr uint16_t COLOR_BUBBLE_UP   = 0x0340;  // dark green  ~(0,104,0)
+static constexpr uint16_t COLOR_BUBBLE_DOWN = 0x9000;  // dark red    ~(144,0,0)
+static constexpr uint16_t COLOR_BUBBLE_FLAT = 0x3186;  // dark grey   ~(48,48,48)
+
+/**
+ * @brief Format a crypto/stock price for compact display (≤6 chars).
+ */
+static void formatCryptoPrice(float price, char* buf, size_t sz) {
+    if (price >= 10000.f)      snprintf(buf, sz, "%.0fK", price / 1000.f);
+    else if (price >= 1000.f)  snprintf(buf, sz, "%.1fK", price / 1000.f);
+    else if (price >= 100.f)   snprintf(buf, sz, "%.0f",  price);
+    else if (price >= 10.f)    snprintf(buf, sz, "%.1f",  price);
+    else if (price >= 1.f)     snprintf(buf, sz, "%.2f",  price);
+    else                       snprintf(buf, sz, "%.3f",  price);
+}
+
+/**
+ * @brief Draw Bitcoin logo: gold circle with white "B" inside.
+ */
+static void drawBtcLogo(int16_t bx, int16_t by) {
+    constexpr uint16_t GOLD = 0xFEA0;  // ~RGB(255, 212, 0)
+    int16_t cx = (int16_t)(bx + 13);
+    int16_t cy = (int16_t)(by + CW_CRYPTO_H / 2);
+    g_lcd.fillCircle(cx, cy, 10, GOLD);
+    g_lcd.setTextSize(2);
+    g_lcd.setTextColor(LCD_WHITE, GOLD);
+    g_lcd.setCursor((int16_t)(cx - 6), (int16_t)(cy - 8));
+    g_lcd.print("B");
+}
+
+/**
+ * @brief Draw Ethereum logo: two-triangle diamond shape.
+ */
+static void drawEthLogo(int16_t bx, int16_t by) {
+    constexpr uint16_t LIGHT = 0xBDF7;  // light grey ~(189,188,189)
+    constexpr uint16_t DARK  = 0x8410;  // medium grey ~(130,128,130)
+    int16_t cx = (int16_t)(bx + 13);
+    int16_t cy = (int16_t)(by + CW_CRYPTO_H / 2);
+    // Upper triangle (pointing up)
+    g_lcd.fillTriangle(cx, (int16_t)(cy - 11),
+                       (int16_t)(cx - 9), cy,
+                       (int16_t)(cx + 9), cy, LIGHT);
+    // Lower triangle (pointing down)
+    g_lcd.fillTriangle(cx, (int16_t)(cy + 11),
+                       (int16_t)(cx - 9), cy,
+                       (int16_t)(cx + 9), cy, DARK);
+    // Thin white mid-line for definition
+    g_lcd.drawFastHLine((int16_t)(cx - 9), cy, 18, LCD_WHITE);
+}
+
+/**
+ * @brief Draw FWRG (ETF) logo: white "$" symbol.
+ */
+static void drawFwrgLogo(int16_t bx, int16_t by, uint16_t bubbleBg) {
+    int16_t tx = (int16_t)(bx + 3);
+    int16_t ty = (int16_t)(by + CW_CRYPTO_H / 2 - 8);
+    g_lcd.setTextSize(2);
+    g_lcd.setTextColor(LCD_WHITE, bubbleBg);
+    g_lcd.setCursor(tx, ty);
+    g_lcd.print("$");
+}
+
+/**
+ * @brief Draw all three crypto price bubbles at the bottom of the clock screen.
+ */
+static void lcdDrawCryptoBubbles() {
+    for (int i = 0; i < 3; i++) {
+        int16_t bx = CW_CRYPTO_BX[i];
+        int16_t by = CW_CRYPTO_Y;
+
+        if (i >= (int)s_cryptoCount) {
+            // No data for this slot — erase
+            g_lcd.fillRect(bx, by, CW_CRYPTO_W, CW_CRYPTO_H, LCD_BLACK);
+            continue;
+        }
+
+        const CryptoTicker& t = s_cryptoTickers[i];
+
+        // Bubble background
+        uint16_t bg = COLOR_BUBBLE_FLAT;
+        if (t.valid) {
+            if (t.change7d > 0.05f)       bg = COLOR_BUBBLE_UP;
+            else if (t.change7d < -0.05f) bg = COLOR_BUBBLE_DOWN;
+        }
+        g_lcd.fillRoundRect(bx, by, CW_CRYPTO_W, CW_CRYPTO_H, CW_CRYPTO_R, bg);
+
+        // Logo (left 25 px of bubble)
+        if (i == 0)      drawBtcLogo(bx, by);
+        else if (i == 1) drawEthLogo(bx, by);
+        else             drawFwrgLogo(bx, by, bg);
+
+        // Text area: x+26 .. x+74
+        int16_t tx = (int16_t)(bx + 26);
+
+        // Line 1: ticker symbol (padded to 4 chars so redraw clears previous content)
+        g_lcd.setTextSize(1);
+        g_lcd.setTextColor(LCD_WHITE, bg);
+        g_lcd.setCursor(tx, (int16_t)(by + 4));
+        char symBuf[5];
+        snprintf(symBuf, sizeof(symBuf), "%-4s", t.symbol);
+        g_lcd.print(symBuf);
+
+        if (t.valid) {
+            // Line 2: price
+            char priceBuf[8];
+            formatCryptoPrice(t.price, priceBuf, sizeof(priceBuf));
+            char line2[9];
+            snprintf(line2, sizeof(line2), "$%-6s", priceBuf);
+            g_lcd.setCursor(tx, (int16_t)(by + 14));
+            g_lcd.print(line2);
+
+            // Line 3: 7d change (or 1d for stocks)
+            char changeBuf[9];
+            snprintf(changeBuf, sizeof(changeBuf), "%+.1f%%  ", t.change7d);
+            changeBuf[7] = '\0';
+            g_lcd.setCursor(tx, (int16_t)(by + 25));
+            g_lcd.print(changeBuf);
+        } else {
+            g_lcd.setCursor(tx, (int16_t)(by + 14));
+            g_lcd.print("...    ");
+            g_lcd.setCursor(tx, (int16_t)(by + 25));
+            g_lcd.print("       ");
+        }
+    }
+}
+
+/**
+ * @brief Draw a single centered row using text-background overdraw (no fillRect = no flicker).
+ *        Safe only when text length never changes between refreshes (fixed-format strings like
+ *        "HH:MM:SS"). For variable-length text, call g_lcd.fillRect() on the row first.
+ */
+static void lcdDrawCenteredRow(int16_t y, uint8_t size, const String& text, uint16_t fg) {
+    int16_t textW = (int16_t)(text.length() * 6 * size);
+    int16_t x     = (int16_t)(((int16_t)LCD_W - textW) / 2);
+    if (x < 0) x  = 0;
+    g_lcd.setTextSize(size);
+    g_lcd.setTextColor(fg, LCD_BLACK);  // bg=BLACK draws character background without fillRect
+    g_lcd.setCursor(x, y);
+    g_lcd.print(text);
+}
+
+/**
+ * @brief Render the clock+weather screen; called every loop when no GIF is playing
+ */
+static void lcdDrawClockWeather() {
+    time_t now = time(nullptr);
+    struct tm* tm_info = localtime(&now);
+
+    bool forceFullRedraw = s_wasGifPlaying || s_clockFirstDraw;
+    bool secondChanged   = (now != s_cwLastSecond);
+    bool weatherChanged  = (s_cwSerial != s_cwLastSerial);
+    bool cryptoChanged   = (s_cryptoSerial != s_cryptoLastSerial);
+
+    s_wasGifPlaying  = false;
+    s_clockFirstDraw = false;
+
+    if (!forceFullRedraw && !secondChanged && !weatherChanged && !cryptoChanged) {
+        return;
+    }
+
+    if (forceFullRedraw) {
+        g_lcd.fillScreen(LCD_BLACK);
+    }
+
+    // --- Time + date (every second) ---
+    if (forceFullRedraw || secondChanged) {
+        if (now > CW_REASONABLE_EPOCH) {
+            char dateBuf[20];
+            strftime(dateBuf, sizeof(dateBuf), "%a %d %b", tm_info);
+            lcdDrawCenteredRow(CW_DATE_Y, CW_DATE_SIZE, String(dateBuf), LCD_GREY);
+
+            char timeBuf[12];
+            snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+                     tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+            lcdDrawCenteredRow(CW_TIME_Y, CW_TIME_SIZE, String(timeBuf), LCD_WHITE);
+        } else {
+            lcdDrawCenteredRow(CW_DATE_Y, CW_DATE_SIZE, "Syncing NTP...", LCD_GREY);
+            lcdDrawCenteredRow(CW_TIME_Y, CW_TIME_SIZE, "--:--:--", LCD_GREY);
+        }
+        s_cwLastSecond = now;
+    }
+
+    // --- Weather section (only when data changes or on full redraw) ---
+    if ((forceFullRedraw || weatherChanged) && s_cwLocation[0] != '\0') {
+        // Temperature — variable length, clear row first
+        g_lcd.fillRect(0, CW_TEMP_Y, (int16_t)LCD_W, (int16_t)(8 * CW_TEMP_SIZE), LCD_BLACK);
+        if (s_cwValid) {
+            char tempBuf[10];
+            snprintf(tempBuf, sizeof(tempBuf), "%d'C", s_cwTempC);
+            lcdDrawCenteredRow(CW_TEMP_Y, CW_TEMP_SIZE, String(tempBuf), LCD_YELLOW);
+        } else {
+            lcdDrawCenteredRow(CW_TEMP_Y, CW_TEMP_SIZE, "---", LCD_GREY);
+        }
+
+        // Description — reserve 2 lines, clear them first
+        g_lcd.fillRect(0, CW_DESC_Y, (int16_t)LCD_W,
+                       (int16_t)(2 * 8 * CW_DESC_SIZE), LCD_BLACK);
+        if (s_cwValid && s_cwDesc[0] != '\0') {
+            lcdDrawTextWrapped(DISPLAY_PADDING, CW_DESC_Y, String(s_cwDesc),
+                               CW_DESC_SIZE, LCD_GREY, LCD_BLACK, false);
+        } else {
+            lcdDrawTextWrapped(DISPLAY_PADDING, CW_DESC_Y, "Fetching weather...",
+                               CW_DESC_SIZE, LCD_DARK_GREY, LCD_BLACK, false);
+        }
+
+        // Umbrella recommendation — variable length, clear row first
+        g_lcd.fillRect(0, CW_UMBRELLA_Y, (int16_t)LCD_W, (int16_t)(8 * CW_UMBRELLA_SIZE), LCD_BLACK);
+        if (s_cwValid) {
+            if (s_cwUmbrella) {
+                lcdDrawCenteredRow(CW_UMBRELLA_Y, CW_UMBRELLA_SIZE, "Bring umbrella!", LCD_CYAN);
+            } else {
+                lcdDrawCenteredRow(CW_UMBRELLA_Y, CW_UMBRELLA_SIZE, "No umbrella :)", LCD_GREEN);
+            }
+        }
+
+        // Location + last update time on one line
+        if (s_cwUpdatedMs > 0 && s_cwValid) {
+            unsigned long elapsedMs = millis() - s_cwUpdatedMs;
+            time_t updEpoch = now - static_cast<time_t>(elapsedMs / 1000UL);
+            struct tm* u = localtime(&updEpoch);
+            char locBuf[48];
+            snprintf(locBuf, sizeof(locBuf), "%s  upd %02d:%02d",
+                     s_cwLocation, u->tm_hour, u->tm_min);
+            lcdDrawCenteredRow(CW_LOC_Y, CW_LOC_SIZE, String(locBuf), LCD_DARK_GREY);
+        } else {
+            lcdDrawCenteredRow(CW_LOC_Y, CW_LOC_SIZE, String(s_cwLocation), LCD_DARK_GREY);
+        }
+
+        s_cwLastSerial = s_cwSerial;
+    }
+
+    // --- Crypto bubbles (bottom of screen) ---
+    if (forceFullRedraw || cryptoChanged) {
+        lcdDrawCryptoBubbles();
+        s_cryptoLastSerial = s_cryptoSerial;
+    }
+}
+
+auto DisplayManager::update() -> void {
+    if (s_gif.isPlaying()) {
+        s_gif.update();
+        s_wasGifPlaying = true;
+    } else {
+        lcdDrawClockWeather();
+    }
+}
 
 /**
  * @brief Clear the entire display to black
  *
  * @return void
  */
-auto DisplayManager::clearScreen() -> void { g_lcd.fillScreen(LCD_BLACK); }
+auto DisplayManager::clearScreen() -> void {
+    g_lcd.fillScreen(LCD_BLACK);
+    s_wasGifPlaying = true;  // force clock redraw after any explicit clear
+}
+
+/**
+ * @brief Update the weather data shown on the clock screen
+ *
+ * @param tempC      Temperature in Celsius
+ * @param desc       Short weather description (e.g. "Partly cloudy")
+ * @param umbrella   true if rain is expected in the next few hours
+ * @param valid      false while still fetching / on HTTP error
+ * @param location   City name shown on screen; empty string disables weather display
+ */
+void DisplayManager::setWeatherData(int tempC, const char* desc, bool umbrella, bool valid,
+                                    const char* location) {
+    s_cwTempC    = tempC;
+    s_cwUmbrella = umbrella;
+    s_cwValid    = valid;
+    s_cwUpdatedMs = valid ? millis() : s_cwUpdatedMs;
+    if (desc)     { strncpy(s_cwDesc,     desc,     sizeof(s_cwDesc)     - 1);
+                    s_cwDesc[sizeof(s_cwDesc) - 1]     = '\0'; }
+    if (location) { strncpy(s_cwLocation, location, sizeof(s_cwLocation) - 1);
+                    s_cwLocation[sizeof(s_cwLocation) - 1] = '\0'; }
+    s_cwSerial++;
+}
+
+/**
+ * @brief Update the crypto price data shown in the bottom bubbles.
+ *
+ * @param tickers  Array of CryptoTicker (from CryptoClient::getTickers())
+ * @param count    Number of valid entries in the array
+ */
+void DisplayManager::setCryptoPrices(const CryptoTicker* tickers, uint8_t count) {
+    if (tickers == nullptr) return;
+    uint8_t n = count < CRYPTO_MAX_COINS ? count : CRYPTO_MAX_COINS;
+    for (uint8_t i = 0; i < n; i++) {
+        s_cryptoTickers[i] = tickers[i];
+    }
+    s_cryptoCount = n;
+    s_cryptoSerial++;
+}

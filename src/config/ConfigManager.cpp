@@ -67,7 +67,13 @@ auto ConfigManager::load() -> bool {
     String api_token = doc["api_token"] | "";
     String ntp_server_cfg = doc["ntp_server"] | "";
 
-    this->lcd_rotation = doc["lcd_rotation"] | lcd_rotation;
+    this->lcd_rotation       = doc["lcd_rotation"] | lcd_rotation;
+    this->wol_url            = (doc["wol_url"] | "");
+    this->wol_mac            = (doc["wol_mac"] | "");
+    this->weather_location   = (doc["weather_location"] | "");
+    this->weather_api_key    = (doc["weather_api_key"] | "");
+    this->lcd_brightness     = doc["lcd_brightness"] | (uint8_t)100;
+    this->crypto_coins       = (doc["crypto_coins"] | "");
 
     String nvs_ssid = secure.get("wifi_ssid", "");
     String nvs_password = secure.get("wifi_password", "");
@@ -194,6 +200,22 @@ auto ConfigManager::save() -> bool {
     doc["lcd_rotation"] = lcd_rotation;
     if (!this->ntp_server.empty()) {
         doc["ntp_server"] = this->ntp_server.c_str();
+    }
+    if (!this->wol_url.empty()) {
+        doc["wol_url"] = this->wol_url.c_str();
+    }
+    if (!this->wol_mac.empty()) {
+        doc["wol_mac"] = this->wol_mac.c_str();
+    }
+    if (!this->weather_location.empty()) {
+        doc["weather_location"] = this->weather_location.c_str();
+    }
+    if (!this->weather_api_key.empty()) {
+        doc["weather_api_key"] = this->weather_api_key.c_str();
+    }
+    doc["lcd_brightness"] = this->lcd_brightness;
+    if (!this->crypto_coins.empty()) {
+        doc["crypto_coins"] = this->crypto_coins.c_str();
     }
 
     if (serializeJson(doc, file) == 0) {

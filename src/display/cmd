@@ -1,0 +1,1 @@
+curl -s -X POST http://192.168.0.46/api/v1/ota/fw   -H "Authorization: Bearer ZrZD37b5cQMy"   -F "firmware=@.pio/build/esp12e/firmware.bin"   --max-time 120 -w "\nHTTP %{http_code}\n" && sleep 18 && curl -s --max-time 5 http://192.168.0.46/ -w "HTTP %{http_code}" -o /dev/null

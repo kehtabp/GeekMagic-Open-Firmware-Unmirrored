@@ -17,30 +17,33 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef NTP_CLIENT_H
-#define NTP_CLIENT_H
+#pragma once
 
 #include <Arduino.h>
 
-class NTPClient {
-   public:
-    NTPClient();
-    void begin(uint32_t syncIntervalSeconds = 24 * 3600, uint8_t maxRetries = 3);
-    void loop();
-    bool syncNow();
-
-    bool lastSyncOk() const;
-    time_t lastSyncTime() const;
-    String lastStatus() const;
-
-   private:
-    uint32_t _syncIntervalSeconds = 24 * 3600;
-    uint8_t _maxRetries = 3;
-    time_t _lastSync = 0;
-    bool _lastOk = false;
-    String _lastStatus = "never synced";
-    unsigned long _nextSyncAttemptMs = 0;
-    void performSync();
+struct WeatherData {
+    int  tempC       = 0;
+    char description[48] = {};
+    bool umbrella    = false;
+    bool valid       = false;
 };
 
-#endif  // NTP_CLIENT_H
+class WeatherClient {
+   public:
+    void begin(const String& location, const String& apiKey);
+    void loop();
+    const WeatherData& getData() const;
+    uint32_t getSerial() const;
+
+   private:
+    void fetch();
+
+    String        _location;
+    String        _apiKey;
+    WeatherData   _data;
+    uint32_t      _serial      = 0;
+    unsigned long _lastFetchMs = 0;
+    bool          _fetchedOnce = false;
+
+    static constexpr unsigned long FETCH_INTERVAL_MS = 10UL * 60UL * 1000UL;
+};

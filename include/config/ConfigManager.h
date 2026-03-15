@@ -66,6 +66,30 @@ class ConfigManager {
     void setNtpServer(const char* s) {
         if (s) ntp_server = s;
     }
+
+    const char* getWolUrl() const { return wol_url.c_str(); }
+    const char* getWolMac() const { return wol_mac.c_str(); }
+    const char* getWeatherLocation() const { return weather_location.c_str(); }
+    void setWeatherLocation(const char* loc) {
+        if (loc) weather_location = loc;
+    }
+    const char* getWeatherApiKey() const { return weather_api_key.c_str(); }
+    void setWeatherApiKey(const char* key) {
+        if (key) weather_api_key = key;
+    }
+
+    uint8_t getLcdBrightness() const { return lcd_brightness; }
+    void setLcdBrightness(uint8_t b) { lcd_brightness = b; }
+
+    const char* getCryptoCoins() const { return crypto_coins.c_str(); }
+    void setCryptoCoins(const char* s) { if (s) crypto_coins = s; }
+
+    std::string wol_url;
+    std::string wol_mac;
+    std::string weather_location;
+    std::string weather_api_key;
+    uint8_t     lcd_brightness = 100;
+    std::string crypto_coins;   // e.g. "bitcoin:BTC,ethereum:ETH"
 };
 
 #endif  // CONFIG_MANAGER_H

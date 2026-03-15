@@ -21,13 +21,18 @@
 
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
+#include "crypto/CryptoClient.h"
 
 // Colors definitions
-static constexpr uint16_t LCD_BLACK = 0x0000;
-static constexpr uint16_t LCD_WHITE = 0xFFFF;
-static constexpr uint16_t LCD_RED = 0xF800;
-static constexpr uint16_t LCD_GREEN = 0x07E0;
-static constexpr uint16_t LCD_BLUE = 0x001F;
+static constexpr uint16_t LCD_BLACK     = 0x0000;
+static constexpr uint16_t LCD_WHITE     = 0xFFFF;
+static constexpr uint16_t LCD_RED       = 0xF800;
+static constexpr uint16_t LCD_GREEN     = 0x07E0;
+static constexpr uint16_t LCD_BLUE      = 0x001F;
+static constexpr uint16_t LCD_YELLOW    = 0xFFE0;
+static constexpr uint16_t LCD_CYAN      = 0x07FF;
+static constexpr uint16_t LCD_GREY      = 0x8410;
+static constexpr uint16_t LCD_DARK_GREY = 0x4208;
 
 static constexpr int ONE_LINE_SPACE = 20;
 static constexpr int TWO_LINES_SPACE = 40;
@@ -46,4 +51,8 @@ class DisplayManager {
     static bool stopGif();
     static void update();
     static void clearScreen();
+    static void setWeatherData(int tempC, const char* desc, bool umbrella, bool valid,
+                               const char* location);
+    static void setBrightness(uint8_t percent);
+    static void setCryptoPrices(const CryptoTicker* tickers, uint8_t count);
 };

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Display</title>
+    <link rel="stylesheet" href="./css/pico.min.css" />
+    <link rel="stylesheet" href="./css/style.css" />
+    <script src="./js/alpinejs.min.js" defer></script>
+    <script src="./js/utils.js"></script>
+    <script src="./js/themeSwitcher.js"></script>
+    <script src="./js/displayHandler.js"></script>
+    <script src="./js/main.js"></script>
+  </head>
+  <body>
+    <main class="container">
+      <header id="header-placeholder"></header>
+
+      <a href="./index.html" class="wifi-back-link">← Back to Home</a>
+
+      <section x-data="displayHandler()" x-init="init()">
+
+        <h2>Brightness</h2>
+        <div style="display: flex; align-items: center; gap: 1em;">
+          <input
+            type="range"
+            min="0"
+            max="100"
+            style="flex: 1"
+            x-bind:value="brightness"
+            x-on:input="setBrightness($event.target.value)"
+          />
+          <span x-text="brightness + '%'" style="min-width: 3em; text-align: right;"></span>
+        </div>
+
+        <hr />
+
+        <h2>Weather</h2>
+        <label for="weather-location">City</label>
+        <input
+          id="weather-location"
+          type="text"
+          x-model="weatherLocation"
+          placeholder="London"
+        />
+
+        <label for="weather-api-key" style="margin-top: 0.75em; display: block;">OpenWeatherMap API Key</label>
+        <input
+          id="weather-api-key"
+          type="text"
+          x-model="weatherApiKey"
+          placeholder="your free API key from openweathermap.org"
+        />
+
+        <div style="margin-top: 0.75em; display: flex; align-items: center; gap: 1em;">
+          <button
+            type="button"
+            class="primary"
+            x-bind:disabled="loading"
+            x-on:click="saveWeather()"
+          >
+            Save
+          </button>
+          <span x-text="message" style="color: var(--pico-color-green-500);"></span>
+        </div>
+
+        <hr />
+
+        <h2>Crypto / Stock Tickers</h2>
+        <p style="font-size: 0.85em; color: var(--pico-muted-color);">
+          Two crypto coins fetched from CoinGecko (7-day change). FWRG ETF is always shown in the third bubble (1-day change via Yahoo Finance).
+        </p>
+        <label for="crypto-coins">Crypto coins (format: <code>id:SYMBOL,id:SYMBOL</code>)</label>
+        <input
+          id="crypto-coins"
+          type="text"
+          x-model="cryptoCoins"
+          placeholder="bitcoin:BTC,ethereum:ETH"
+        />
+
+        <div style="margin-top: 0.75em; display: flex; align-items: center; gap: 1em;">
+          <button
+            type="button"
+            class="primary"
+            x-bind:disabled="loading"
+            x-on:click="saveCrypto()"
+          >
+            Save
+          </button>
+          <span x-text="cryptoMessage" style="color: var(--pico-color-green-500);"></span>
+        </div>
+
+      </section>
+
+      <footer id="footer-placeholder"></footer>
+    </main>
+  </body>
+</html>
