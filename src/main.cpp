@@ -55,28 +55,10 @@ static constexpr int LOADING_DELAY_MS = 1000;
 
 Webserver* webserver = nullptr;
 NTPClient* ntpClient = nullptr;
-static WakeOnLan wakeOnLan;
+WakeOnLan wakeOnLan;
 WeatherClient weatherClient;
 CryptoClient cryptoClient;
 
-/**
- * @brief Stop the webserver to free heap for BearSSL TLS (called by CryptoClient).
- */
-void cryptoWebserverPause() {
-    if (webserver != nullptr) {
-        webserver->raw().stop();
-        delay(30);
-    }
-}
-
-/**
- * @brief Restart the webserver after BearSSL TLS operations (called by CryptoClient).
- */
-void cryptoWebserverResume() {
-    if (webserver != nullptr) {
-        webserver->raw().begin();
-    }
-}
 
 /**
  * @brief Formats bytes into a human-readable string

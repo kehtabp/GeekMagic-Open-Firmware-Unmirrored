@@ -69,6 +69,8 @@ class ConfigManager {
 
     const char* getWolUrl() const { return wol_url.c_str(); }
     const char* getWolMac() const { return wol_mac.c_str(); }
+    void setWolUrl(const char* url) { if (url) wol_url = url; }
+    void setWolMac(const char* mac) { if (mac) wol_mac = mac; }
     const char* getWeatherLocation() const { return weather_location.c_str(); }
     void setWeatherLocation(const char* loc) {
         if (loc) weather_location = loc;

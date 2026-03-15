@@ -68,14 +68,14 @@
 
         <h2>Crypto / Stock Tickers</h2>
         <p style="font-size: 0.85em; color: var(--pico-muted-color);">
-          Two crypto coins fetched from CoinGecko (7-day change). FWRG ETF is always shown in the third bubble (1-day change via Yahoo Finance).
+          Three coins fetched from CoinLore (7-day change). Supported names: bitcoin, ethereum, litecoin, dogecoin, xrp, solana, cardano — or a raw CoinLore numeric ID.
         </p>
-        <label for="crypto-coins">Crypto coins (format: <code>id:SYMBOL,id:SYMBOL</code>)</label>
+        <label for="crypto-coins">Crypto coins (format: <code>id:SYMBOL,id:SYMBOL,id:SYMBOL</code>)</label>
         <input
           id="crypto-coins"
           type="text"
           x-model="cryptoCoins"
-          placeholder="bitcoin:BTC,ethereum:ETH"
+          placeholder="bitcoin:BTC,ethereum:ETH,litecoin:LTC"
         />
 
         <div style="margin-top: 0.75em; display: flex; align-items: center; gap: 1em;">
@@ -88,6 +88,40 @@
             Save
           </button>
           <span x-text="cryptoMessage" style="color: var(--pico-color-green-500);"></span>
+        </div>
+
+        <hr />
+
+        <h2>Wake-on-LAN</h2>
+        <p style="font-size: 0.85em; color: var(--pico-muted-color);">
+          Poll a URL every 10 seconds. If it returns <code>1</code>, a magic packet is sent to the configured MAC address.
+        </p>
+        <label for="wol-url">Poll URL</label>
+        <input
+          id="wol-url"
+          type="text"
+          x-model="wolUrl"
+          placeholder="http://192.168.1.1/pc-status"
+        />
+
+        <label for="wol-mac" style="margin-top: 0.75em; display: block;">Target MAC Address</label>
+        <input
+          id="wol-mac"
+          type="text"
+          x-model="wolMac"
+          placeholder="AA:BB:CC:DD:EE:FF"
+        />
+
+        <div style="margin-top: 0.75em; display: flex; align-items: center; gap: 1em;">
+          <button
+            type="button"
+            class="primary"
+            x-bind:disabled="loading"
+            x-on:click="saveWol()"
+          >
+            Save
+          </button>
+          <span x-text="wolMessage" style="color: var(--pico-color-green-500);"></span>
         </div>
 
       </section>

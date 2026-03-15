@@ -31,12 +31,14 @@
 #include "ntp/NTPClient.h"
 #include "weather/WeatherClient.h"
 #include "crypto/CryptoClient.h"
+#include "wol/WakeOnLan.h"
 
 extern ConfigManager configManager;
 extern WiFiManager* wifiManager;
 extern NTPClient* ntpClient;
 extern WeatherClient weatherClient;
 extern CryptoClient cryptoClient;
+extern WakeOnLan wakeOnLan;
 
 static bool otaError = false;
 static size_t otaSize = 0;
@@ -60,6 +62,8 @@ void handleBrightnessGet(Webserver* webserver);
 void handleBrightnessSet(Webserver* webserver);
 void handleCryptoConfigGet(Webserver* webserver);
 void handleCryptoConfigSet(Webserver* webserver);
+void handleWolConfigGet(Webserver* webserver);
+void handleWolConfigSet(Webserver* webserver);
 
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr size_t NTP_CONFIG_DOC_SIZE = 512;
@@ -165,14 +169,44 @@ void registerApiEndpoints(Webserver* webserver) {
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/logs/clear", HTTP_POST, [webserver]() { handleLogsClear(webserver); });
 
-    webserver->raw().on("/api/v1/weather/config", HTTP_POST, [webserver]() { handleWeatherConfigSet(webserver); });
+    // @openapi {get} /weather/config version=v1 group=Weather summary="Get weather configuration" requiresAuth=true
+    // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/weather/config", HTTP_GET,  [webserver]() { handleWeatherConfigGet(webserver); });
 
+    // @openapi {post} /weather/config version=v1 group=Weather summary="Set weather configuration" requiresAuth=true
+    // requestBody=application/json requestBodySchema=weather_location:string,weather_api_key:string
+    // example={"weather_location":"London","weather_api_key":"your_key"}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/weather/config", HTTP_POST, [webserver]() { handleWeatherConfigSet(webserver); });
+
+    // @openapi {get} /display/brightness version=v1 group=Display summary="Get LCD brightness" requiresAuth=true
+    // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/display/brightness", HTTP_GET,  [webserver]() { handleBrightnessGet(webserver); });
+
+    // @openapi {post} /display/brightness version=v1 group=Display summary="Set LCD brightness (0-100)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=brightness:integer example={"brightness":80}
+    // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/display/brightness", HTTP_POST, [webserver]() { handleBrightnessSet(webserver); });
 
+    // @openapi {get} /crypto/config version=v1 group=Crypto summary="Get crypto coins configuration" requiresAuth=true
+    // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/crypto/config", HTTP_GET,  [webserver]() { handleCryptoConfigGet(webserver); });
+
+    // @openapi {post} /crypto/config version=v1 group=Crypto summary="Set crypto coins configuration" requiresAuth=true
+    // requestBody=application/json requestBodySchema=crypto_coins:string
+    // example={"crypto_coins":"bitcoin:BTC,ethereum:ETH"}
+    // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/crypto/config", HTTP_POST, [webserver]() { handleCryptoConfigSet(webserver); });
+
+    // @openapi {get} /wol/config version=v1 group=WakeOnLan summary="Get Wake-on-LAN configuration" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/wol/config", HTTP_GET,  [webserver]() { handleWolConfigGet(webserver); });
+
+    // @openapi {post} /wol/config version=v1 group=WakeOnLan summary="Set Wake-on-LAN configuration" requiresAuth=true
+    // requestBody=application/json requestBodySchema=wol_url:string,wol_mac:string
+    // example={"wol_url":"http://192.168.1.1/status","wol_mac":"AA:BB:CC:DD:EE:FF"}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/wol/config", HTTP_POST, [webserver]() { handleWolConfigSet(webserver); });
 
     webserver->raw().onNotFound([webserver]() {
         if (webserver->raw().method() == HTTP_OPTIONS) {
@@ -1659,6 +1693,80 @@ void handleCryptoConfigSet(Webserver* webserver) {
     JsonDocument doc;
     doc["status"]       = "ok";
     doc["crypto_coins"] = configManager.getCryptoCoins();
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Return the current Wake-on-LAN configuration.
+ * Response: {"wol_url":"...","wol_mac":"..."}
+ */
+void handleWolConfigGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) return;
+
+    JsonDocument doc;
+    doc["wol_url"] = configManager.getWolUrl();
+    doc["wol_mac"] = configManager.getWolMac();
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Update the Wake-on-LAN configuration, persist it, and re-initialise the WoL client.
+ * Body: {"wol_url":"http://host/status","wol_mac":"AA:BB:CC:DD:EE:FF"}
+ */
+void handleWolConfigSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) return;
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Missing JSON body";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    JsonDocument ddoc;
+    if (deserializeJson(ddoc, webserver->raw().arg("plain"))) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Invalid JSON";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    const char* url = ddoc["wol_url"] | "";
+    const char* mac = ddoc["wol_mac"] | "";
+    if (strlen(url) > 0) configManager.setWolUrl(url);
+    if (strlen(mac) > 0) configManager.setWolMac(mac);
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"]  = "error";
+        doc["message"] = "Failed to save config";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+        return;
+    }
+
+    wakeOnLan.begin(configManager.getWolUrl(), configManager.getWolMac());
+
+    JsonDocument doc;
+    doc["status"]  = "ok";
+    doc["wol_url"] = configManager.getWolUrl();
+    doc["wol_mac"] = configManager.getWolMac();
     String json;
     serializeJson(doc, json);
     setCorsHeaders(webserver);

@@ -20,35 +20,53 @@
 #include "crypto/CryptoClient.h"
 #include "wireless/WiFiManager.h"
 #include <Logger.h>
-#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
 #include <ESP8266HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Arduino.h>
 
 static constexpr const char* TAG = "CryptoClient";
 
-// Defined in main.cpp — stop/restart the webserver to free heap for BearSSL TLS
-extern void cryptoWebserverPause();
-extern void cryptoWebserverResume();
+// ---------------------------------------------------------------------------
+// CoinLore ID lookup — maps common CoinGecko-style names to CoinLore numeric IDs
+// ---------------------------------------------------------------------------
+static const struct { const char* name; const char* id; } COINLORE_IDS[] = {
+    {"bitcoin",   "90"},
+    {"ethereum",  "80"},
+    {"litecoin",  "1"},
+    {"dogecoin",  "2"},
+    {"xrp",       "58"},
+    {"solana",    "48543"},
+    {"cardano",   "257679"},
+    {nullptr,     nullptr}
+};
+
+static const char* coinLoreId(const char* name) {
+    for (int i = 0; COINLORE_IDS[i].name != nullptr; i++) {
+        if (strcmp(name, COINLORE_IDS[i].name) == 0) return COINLORE_IDS[i].id;
+    }
+    return name;  // fall back: treat as a raw CoinLore numeric ID
+}
 
 // ---------------------------------------------------------------------------
-// parseCoinsCfg — fills slots 0..(CRYPTO_MAX_COINS-2) from "id:SYM,..." cfg
+// parseCoinsCfg — fills up to CRYPTO_MAX_COINS slots from "id:SYM,..." config
 // ---------------------------------------------------------------------------
 void CryptoClient::parseCoinsCfg(const String& cfg) {
     _count = 0;
 
     if (cfg.isEmpty()) {
-        // Defaults: BTC and ETH
         strncpy(_tickers[0].id,     "bitcoin",  sizeof(_tickers[0].id)     - 1);
         strncpy(_tickers[0].symbol, "BTC",      sizeof(_tickers[0].symbol) - 1);
         strncpy(_tickers[1].id,     "ethereum", sizeof(_tickers[1].id)     - 1);
         strncpy(_tickers[1].symbol, "ETH",      sizeof(_tickers[1].symbol) - 1);
-        _count = 2;
+        strncpy(_tickers[2].id,     "litecoin", sizeof(_tickers[2].id)     - 1);
+        strncpy(_tickers[2].symbol, "LTC",      sizeof(_tickers[2].symbol) - 1);
+        _count = 3;
         return;
     }
 
     String remaining = cfg;
-    while (!remaining.isEmpty() && _count < (CRYPTO_MAX_COINS - 1)) {
+    while (!remaining.isEmpty() && _count < CRYPTO_MAX_COINS) {
         int comma = remaining.indexOf(',');
         String pair = (comma >= 0) ? remaining.substring(0, comma) : remaining;
         remaining   = (comma >= 0) ? remaining.substring(comma + 1) : String("");
@@ -71,18 +89,10 @@ void CryptoClient::parseCoinsCfg(const String& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// begin — parse config, always add FWRG (stock ETF) as last slot
+// begin — parse config
 // ---------------------------------------------------------------------------
 void CryptoClient::begin(const String& coins) {
     parseCoinsCfg(coins);
-
-    // Slot 2: FWRG stock ETF (always present, fetched from Yahoo Finance)
-    strncpy(_tickers[2].id,     "FWRG", sizeof(_tickers[2].id)     - 1);
-    strncpy(_tickers[2].symbol, "FWRG", sizeof(_tickers[2].symbol) - 1);
-    _tickers[2].id[sizeof(_tickers[2].id) - 1]         = '\0';
-    _tickers[2].symbol[sizeof(_tickers[2].symbol) - 1] = '\0';
-    _count = 3;
-
     Logger::info(("CryptoClient: " + String(_count) + " tickers").c_str(), TAG);
 }
 
@@ -102,146 +112,69 @@ const CryptoTicker* CryptoClient::getTickers() const { return _tickers; }
 uint32_t            CryptoClient::getSerial()   const { return _serial;  }
 
 // ---------------------------------------------------------------------------
-// fetchFromCoinGecko — GET prices + 7d change for crypto slots 0..(n-1)
+// fetchFromCoinLore — GET prices + 7d change over plain HTTP
 // ---------------------------------------------------------------------------
-static bool fetchFromCoinGecko(CryptoTicker* tickers, int cryptoCount) {
-    // Build comma-separated ids string
+static bool fetchFromCoinLore(CryptoTicker* tickers, int count) {
     String ids;
-    for (int i = 0; i < cryptoCount; i++) {
+    for (int i = 0; i < count; i++) {
+        if (tickers[i].id[0] == '\0') continue;
         if (ids.length()) ids += ',';
-        ids += tickers[i].id;
+        ids += coinLoreId(tickers[i].id);
     }
     if (ids.isEmpty()) return false;
 
-    String url = String("https://api.coingecko.com/api/v3/simple/price?ids=") + ids +
-                 "&vs_currencies=usd&include_7d_change=true";
+    String url = String("http://api.coinlore.net/api/ticker/?id=") + ids;
 
-    BearSSL::WiFiClientSecure wcs;
-    wcs.setInsecure();
-    wcs.setBufferSizes(4096, 512);
-
-    HTTPClient https;
-    if (!https.begin(wcs, url)) {
-        Logger::warn("CoinGecko begin() failed", TAG);
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+        Logger::warn("CoinLore begin() failed", TAG);
         return false;
     }
-    https.addHeader("User-Agent", "ESP8266/1.0");
+    http.addHeader("User-Agent", "ESP8266/1.0");
 
-    int code = https.GET();
+    int code = http.GET();
     if (code != 200) {
-        Logger::warn(("CoinGecko HTTP " + String(code)).c_str(), TAG);
-        https.end();
+        Logger::warn(("CoinLore HTTP " + String(code)).c_str(), TAG);
+        http.end();
         return false;
-    }
-
-    JsonDocument filter;
-    for (int i = 0; i < cryptoCount; i++) {
-        filter[tickers[i].id]["usd"]          = true;
-        filter[tickers[i].id]["usd_7d_change"] = true;
     }
 
     JsonDocument doc;
-    DeserializationError err = deserializeJson(
-        doc, https.getStream(), DeserializationOption::Filter(filter));
-    https.end();
+    DeserializationError err = deserializeJson(doc, http.getStream());
+    http.end();
 
     if (err) {
-        Logger::warn(("CoinGecko parse: " + String(err.c_str())).c_str(), TAG);
+        Logger::warn(("CoinLore parse: " + String(err.c_str())).c_str(), TAG);
         return false;
     }
 
-    for (int i = 0; i < cryptoCount; i++) {
-        JsonObject coin = doc[tickers[i].id].as<JsonObject>();
-        if (!coin.isNull()) {
-            tickers[i].price    = coin["usd"]          | 0.0f;
-            tickers[i].change7d = coin["usd_7d_change"] | 0.0f;
-            tickers[i].valid    = true;
+    JsonArray arr = doc.as<JsonArray>();
+    for (JsonObject coin : arr) {
+        const char* nameid = coin["nameid"] | "";
+        const char* sym    = coin["symbol"]  | "";
+        for (int i = 0; i < count; i++) {
+            if (strcmp(nameid, tickers[i].id) == 0 ||
+                strcasecmp(sym, tickers[i].symbol) == 0) {
+                tickers[i].price    = atof(coin["price_usd"]        | "0");
+                tickers[i].change7d = atof(coin["percent_change_7d"] | "0");
+                tickers[i].valid    = true;
+                break;
+            }
         }
     }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// fetchFwrgFromYahoo — GET FWRG stock quote (1-day change) from Yahoo Finance
-// ---------------------------------------------------------------------------
-static bool fetchFwrgFromYahoo(CryptoTicker& ticker) {
-    const String url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=FWRG";
-
-    BearSSL::WiFiClientSecure wcs;
-    wcs.setInsecure();
-    wcs.setBufferSizes(4096, 512);
-
-    HTTPClient https;
-    if (!https.begin(wcs, url)) {
-        Logger::warn("Yahoo begin() failed", TAG);
-        return false;
-    }
-    https.addHeader("User-Agent", "Mozilla/5.0");
-    https.addHeader("Accept",     "application/json");
-
-    int code = https.GET();
-    if (code != 200) {
-        Logger::warn(("Yahoo HTTP " + String(code)).c_str(), TAG);
-        https.end();
-        return false;
-    }
-
-    JsonDocument filter;
-    filter["quoteResponse"]["result"][0]["regularMarketPrice"]         = true;
-    filter["quoteResponse"]["result"][0]["regularMarketChangePercent"] = true;
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(
-        doc, https.getStream(), DeserializationOption::Filter(filter));
-    https.end();
-
-    if (err) {
-        Logger::warn(("FWRG parse: " + String(err.c_str())).c_str(), TAG);
-        return false;
-    }
-
-    JsonObject result = doc["quoteResponse"]["result"][0].as<JsonObject>();
-    if (result.isNull()) {
-        Logger::warn("FWRG: no result in response", TAG);
-        return false;
-    }
-
-    ticker.price    = result["regularMarketPrice"]         | 0.0f;
-    ticker.change7d = result["regularMarketChangePercent"] | 0.0f;
-    ticker.valid    = true;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// fetch — stop webserver, run both HTTPS fetches, restart webserver
+// fetch — fetch all tickers from CoinLore over plain HTTP
 // ---------------------------------------------------------------------------
 void CryptoClient::fetch() {
     if (!WiFiManager::isConnected()) return;
 
     Logger::info("Fetching prices...", TAG);
-
-    // Stop webserver to free ~8 KB of heap for BearSSL TLS buffers
-    cryptoWebserverPause();
-
-    // Disable hardware watchdog: TLS handshake can take > 2 s on ESP8266
-    EspClass::wdtDisable();
-
-    // Fetch crypto (BTC + ETH) — slots 0..1
-    if (_count > 1) {
-        fetchFromCoinGecko(_tickers, _count - 1);
-    }
-
-    // Fetch FWRG stock ETF — slot 2
-    fetchFwrgFromYahoo(_tickers[_count - 1]);
-
-    // Re-enable watchdog and restart webserver
-    EspClass::wdtEnable(WDTO_2S);
-    EspClass::wdtFeed();
-
-    cryptoWebserverResume();
-
+    fetchFromCoinLore(_tickers, _count);
     _serial++;
     _fetchedOnce = true;
-
     Logger::info("Prices fetched.", TAG);
 }

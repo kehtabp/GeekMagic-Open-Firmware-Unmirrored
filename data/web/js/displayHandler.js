@@ -4,8 +4,11 @@ function displayHandler() {
     weatherLocation: "",
     weatherApiKey: "",
     cryptoCoins: "",
+    wolUrl: "",
+    wolMac: "",
     message: "",
     cryptoMessage: "",
+    wolMessage: "",
     loading: false,
 
     init() {
@@ -30,6 +33,14 @@ function displayHandler() {
           this.cryptoCoins = data.crypto_coins || "";
         })
         .catch((err) => console.error("failed to fetch crypto config", err));
+
+      apiFetch("/api/v1/wol/config")
+        .then((r) => r.json())
+        .then((data) => {
+          this.wolUrl = data.wol_url || "";
+          this.wolMac = data.wol_mac || "";
+        })
+        .catch((err) => console.error("failed to fetch wol config", err));
     },
 
     setBrightness(value) {
@@ -82,6 +93,27 @@ function displayHandler() {
         })
         .catch(() => {
           this.cryptoMessage = "Request failed";
+        })
+        .finally(() => {
+          this.loading = false;
+        });
+    },
+
+    saveWol() {
+      this.loading = true;
+      this.wolMessage = "";
+      apiFetch("/api/v1/wol/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wol_url: this.wolUrl, wol_mac: this.wolMac }),
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          this.wolMessage =
+            data.status === "ok" ? "Saved!" : data.message || "Error";
+        })
+        .catch(() => {
+          this.wolMessage = "Request failed";
         })
         .finally(() => {
           this.loading = false;
